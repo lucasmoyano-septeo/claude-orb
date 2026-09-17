@@ -19,13 +19,16 @@ from gi.repository import Gtk, GLib, Gdk
 
 import audioop
 import cairo
+import json
 import math
 import os
+import random
 import subprocess
 import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 HOME = os.path.expanduser("~")
 ASSISTANT_DIR = os.path.join(HOME, ".claude", "floating-assistant")
@@ -40,6 +43,60 @@ RATE = "+8%"
 # for changes while Claude is working, so the red flash fires exactly when
 # (and only when) a capture actually happens.
 SCREENSHOT_PATH = os.path.join(ASSISTANT_DIR, "current_screen.png")
+
+# ---- filler speech, so a slow turn isn't dead silence ----------------------
+# We don't try to predict how long Claude will take (that's guessing before
+# there's anything to measure). We measure the actual silence instead: if the
+# reply still isn't ready after OPENER_DELAY, say something; then keep dropping
+# short connectors at random gaps until the real answer is ready.
+FILLER_DIR = os.path.join(ASSISTANT_DIR, "fillers")
+OPENER_DELAY = 1.8          # seconds of silence before the first filler
+CONNECTOR_GAP = (2.5, 5.0)  # random pause between connectors, so silence stays short
+
+# Note on spelling: this voice reads a bare "Mmm" letter by letter ("eme eme
+# eme"), and "Uhm" comes out as "un". Only "Hmm"/"Hmmm" produce an actual hum,
+# so those are the only non-word fillers used here. Verified by synthesizing
+# each line and transcribing it back.
+OPENERS = [
+    "Hmm, déjame pensar.",
+    "A ver, dame un segundo.",
+    "Buena pregunta, lo estoy mirando.",
+    "Hmm, esto necesita un momento.",
+    "Espera, que lo reviso.",
+    "Dame un momentito.",
+    "A ver qué encuentro.",
+    "Uy, esto lleva un poco más.",
+    "Estoy mirándolo, un segundo.",
+    "Hmmm, a ver.",
+    "Déjame revisar eso.",
+    "Un momento que lo compruebo.",
+    "Vale, estoy en ello.",
+    "Eso me lleva un ratito, espera.",
+    "Lo estoy viendo ahora.",
+]
+
+CONNECTORS = [
+    "Hmm.",
+    "A ver.",
+    "Sigo en ello.",
+    "Un poco más.",
+    "Esto es más complejo de lo que parecía.",
+    "Ya casi lo tengo.",
+    "Dame un segundo más.",
+    "Hmmm, a ver.",
+    "Sigo mirando.",
+    "Un momentito más.",
+    "Está tardando un poco.",
+    "Ya voy.",
+    "Aquí sigo.",
+    "Vale, ya casi.",
+    "Un segundo.",
+    "Esto tiene más tela.",
+    "Sigo buscando.",
+    "Ya mismo.",
+    "Aguanta un poco.",
+    "Hmm, casi está.",
+]
 
 import re as _re
 import unicodedata as _unicodedata
@@ -156,6 +213,123 @@ def flash_capture_indicator(duration_ms=420):
     overlay = CaptureFlash()
     overlay.show_all()
     GLib.timeout_add(duration_ms, lambda: (overlay.destroy(), False)[1])
+
+
+def _filler_path(kind, index):
+    return os.path.join(FILLER_DIR, f"{kind}_{index:02d}.mp3")
+
+
+def ensure_fillers():
+    """Renders the filler phrases to mp3 once, in parallel. Re-renders only if
+    the phrase list changed (tracked by a manifest), so startup is free after
+    the first run."""
+    os.makedirs(FILLER_DIR, exist_ok=True)
+    manifest_path = os.path.join(FILLER_DIR, "phrases.json")
+    wanted = {"openers": OPENERS, "connectors": CONNECTORS}
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            if json.load(f) == wanted and all(
+                os.path.exists(_filler_path(k[:-1], i))
+                for k, items in wanted.items()
+                for i in range(len(items))
+            ):
+                return
+    except Exception:
+        pass
+
+    jobs = []
+    for kind, phrases in (("opener", OPENERS), ("connector", CONNECTORS)):
+        for i, phrase in enumerate(phrases):
+            jobs.append((kind, i, phrase))
+
+    def render(job):
+        kind, i, phrase = job
+        txt = tempfile.mktemp(suffix=".txt", dir=FILLER_DIR)
+        try:
+            with open(txt, "w", encoding="utf-8") as f:
+                f.write(phrase)
+            subprocess.run(
+                [EDGE_TTS, "--voice", VOICE, f"--rate={RATE}", "--file", txt,
+                 "--write-media", _filler_path(kind, i)],
+                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
+            )
+        finally:
+            try:
+                os.remove(txt)
+            except OSError:
+                pass
+
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(render, jobs))
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(wanted, f, ensure_ascii=False)
+    log(f"fillers rendered ({len(jobs)} phrases, {time.time()-t0:.1f}s)")
+
+
+class FillerPlayer:
+    """Speaks short filler lines while Claude is still thinking, so a slow turn
+    isn't dead air. Stops the instant the real reply is ready (or the user
+    interrupts): it never overlaps with the actual answer."""
+
+    def __init__(self):
+        self.active = False
+        self.proc = None
+        self._last = {}
+
+    def _pick(self, kind, phrases):
+        """Random, but never the same line twice in a row."""
+        choices = [i for i in range(len(phrases)) if i != self._last.get(kind)]
+        idx = random.choice(choices or list(range(len(phrases))))
+        self._last[kind] = idx
+        return _filler_path(kind, idx)
+
+    def _play(self, path):
+        if not self.active or not os.path.exists(path):
+            return
+        self.proc = subprocess.Popen(
+            ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path],
+            stdin=subprocess.DEVNULL,
+        )
+        self.proc.wait()
+        self.proc = None
+
+    def _run(self):
+        time.sleep(OPENER_DELAY)
+        if not self.active:
+            return
+        self._play(self._pick("opener", OPENERS))
+        while self.active:
+            gap = random.uniform(*CONNECTOR_GAP)
+            waited = 0.0
+            while self.active and waited < gap:
+                time.sleep(0.15)
+                waited += 0.15
+            if not self.active:
+                return
+            self._play(self._pick("connector", CONNECTORS))
+
+    def start(self):
+        if self.active:
+            return
+        self.active = True
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def stop(self, wait=False):
+        """wait=True lets the line currently playing finish (so the real answer
+        doesn't cut it off mid-word); wait=False kills it instantly, which is
+        what a user interruption needs."""
+        self.active = False
+        proc = self.proc
+        if proc and proc.poll() is None:
+            if wait:
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.terminate()
+            else:
+                proc.terminate()
+        self.proc = None
 
 
 def compute_envelope(mp3_path, window_ms=60, sample_rate=16000):
@@ -420,8 +594,11 @@ class WalkieButton(Gtk.Window):
         self.claude_proc = None
         self.tts_proc = None
 
+        self.filler = FillerPlayer()
+
         self.whisper_model = None
         threading.Thread(target=self.load_whisper, daemon=True).start()
+        threading.Thread(target=ensure_fillers, daemon=True).start()
 
         log("=== started (sonnet model, fast flags) ===")
 
@@ -451,10 +628,12 @@ class WalkieButton(Gtk.Window):
 
     # ---------- interruptions ----------
     def _stop_tts(self):
+        self.filler.stop()
         if self.tts_proc and self.tts_proc.poll() is None:
             self.tts_proc.terminate()
 
     def _kill_claude(self):
+        self.filler.stop()
         if self.claude_proc and self.claude_proc.poll() is None:
             self.claude_proc.terminate()
 
@@ -530,9 +709,14 @@ class WalkieButton(Gtk.Window):
             # screenshot ourselves; we just watch the fixed path it's told to write to, and flash
             # the red frame the moment (and only the moments) it actually captures something.
             threading.Thread(target=self._watch_for_capture, args=(self.claude_proc,), daemon=True).start()
+            # fills the silence if this turn turns out to be slow; stops the
+            # moment there's a real answer to speak
+            self.filler.start()
             stdout, stderr = self.claude_proc.communicate(timeout=90)
             rc = self.claude_proc.returncode
             self.claude_proc = None
+            # note: the filler keeps talking on purpose until the reply audio is
+            # actually ready to play (generating it takes a couple of seconds too)
 
             if rc is not None and rc < 0:
                 log(f"turn {my_turn} interrupted mid-Claude")
@@ -559,6 +743,7 @@ class WalkieButton(Gtk.Window):
         except Exception as e:
             log(f"EXCEPTION turn {my_turn}: {e!r}")
         finally:
+            self.filler.stop()
             if os.path.exists(SCREENSHOT_PATH):
                 try:
                     os.remove(SCREENSHOT_PATH)
@@ -594,6 +779,9 @@ class WalkieButton(Gtk.Window):
             if superseded():
                 return
 
+            # the reply audio is ready now: let any filler line finish its word,
+            # then take over. They never overlap.
+            self.filler.stop(wait=True)
             GLib.idle_add(lambda: (self.set_state("speaking"), self.orb.start_speaking(envelope, step_ms)))
             self.tts_proc = subprocess.Popen(
                 ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", mp3_path],
