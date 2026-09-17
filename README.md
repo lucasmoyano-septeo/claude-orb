@@ -23,6 +23,11 @@ a screenshot of your screen taken at that instant, and answers by speaking.
    actual volume envelope of the mp3).
 6. You can interrupt it at any time — while it's thinking or while it's
    speaking — just by pressing the button again.
+7. If it stays silent for a few seconds, it fills the gap: the first time,
+   it says something short out loud ("Hmm, déjame pensar"); after that, any
+   further silence (typically Claude pausing between sentences to use a
+   tool) gets a short looping tone instead, for as long as the silence
+   lasts, instead of repeating itself.
 
 ## ⚠️ Read this before installing
 
@@ -79,6 +84,27 @@ A floating circular orb appears in the bottom-right corner of the screen.
 To stop the app: `pkill -f button.py`, or close the window from your
 taskbar.
 
+**Mouse controls beyond left-click:**
+
+- **Middle-click and drag** the orb to move it anywhere on screen. The
+  position is remembered across restarts.
+- **Right-click** for a menu: pick the **model** (Sonnet/Opus/Haiku/Fable),
+  the **voice** (7 Spanish neural voices) and the **speed**. Changes apply
+  from the next turn on and are remembered too. The menu also has "back to
+  the bottom-right corner" if you get it lost.
+- Hovering shows a pointer cursor, like any clickable button.
+
+All of this is saved in `config.json` (gitignored — it's per-machine, not
+part of the project).
+
+### Swapping the "still thinking" sound
+
+`assets/thinking_loop.mp3` ships with a small synthesized two-tone blip as a
+placeholder. Any short mp3 works — just overwrite that file. If you can grab
+a specific sound from your own browser (myinstants and similar sites block
+direct downloads from servers/scripts with a 403), save it there under that
+exact name.
+
 ## Why it's fast (or why it isn't)
 
 Three things, in order of impact:
@@ -97,9 +123,12 @@ Three things, in order of impact:
    time). Every sentence is synthesized in-process, with an 8 s timeout and
    one retry, so one slow call never stalls the whole reply.
 
-While Claude is still thinking, short filler lines ("Hmm, déjame pensar",
-"Sigo en ello") cover the silence, and stop the moment the first real
-sentence is ready. They only kick in on turns that are actually slow.
+While Claude is still thinking, one filler line ("Hmm, déjame pensar") covers
+the first stretch of silence, then a short tone loops for as long as the
+silence lasts. It stops the instant the first real sentence is ready, and
+resumes automatically if Claude goes quiet again mid-reply (e.g. between two
+sentences while it's using a tool). Only kicks in on turns that are actually
+slow.
 
 What flags can't fix: if Claude decides to use its tools (take a
 screenshot, move the mouse), the turn takes as long as that takes. That's

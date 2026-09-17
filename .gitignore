@@ -4,9 +4,11 @@ __pycache__/
 *.log
 *.wav
 *.mp3
+!assets/thinking_loop.mp3
 *.png
 *.jpg
 *.jpeg
 tmp*.txt
 test.wav
 test_pipeline.py
+config.json

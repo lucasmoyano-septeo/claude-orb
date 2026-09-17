@@ -43,8 +43,67 @@ ASSISTANT_DIR = os.path.join(HOME, ".claude", "floating-assistant")
 LOG_PATH = os.path.join(ASSISTANT_DIR, "assistant.log")
 
 EDGE_TTS = os.path.join(ASSISTANT_DIR, "venv", "bin", "edge-tts")
-VOICE = "es-ES-ElviraNeural"
-RATE = "+8%"
+
+# ---- persisted settings (model, voice, rate, window position) --------------
+CONFIG_PATH = os.path.join(ASSISTANT_DIR, "config.json")
+DEFAULT_CONFIG = {
+    "model": "sonnet",
+    "voice": "es-ES-ElviraNeural",
+    "rate": "+8%",
+    "pos_x": None,
+    "pos_y": None,
+}
+
+# A few known-good Spanish neural voices (same list the /play skill already
+# uses) and a handful of speed presets. Shown in the right-click menu.
+VOICE_CHOICES = [
+    ("es-ES-ElviraNeural", "Elvira (España)"),
+    ("es-ES-XimenaNeural", "Ximena (España)"),
+    ("es-AR-ElenaNeural", "Elena (Argentina)"),
+    ("es-MX-DaliaNeural", "Dalia (México)"),
+    ("es-CO-SalomeNeural", "Salomé (Colombia)"),
+    ("es-CL-CatalinaNeural", "Catalina (Chile)"),
+    ("es-PE-CamilaNeural", "Camila (Perú)"),
+]
+RATE_CHOICES = [
+    ("-15%", "Más lenta"),
+    ("+0%", "Normal"),
+    ("+8%", "Un poco rápida (por defecto)"),
+    ("+20%", "Rápida"),
+    ("+35%", "Muy rápida"),
+]
+# Model aliases the claude CLI accepts. Sonnet is the default because it's the
+# fast/clear balance this assistant is tuned for; the others trade that off.
+MODEL_CHOICES = [
+    ("sonnet", "Sonnet (rápido, recomendado)"),
+    ("opus", "Opus (más profundo, más lento)"),
+    ("haiku", "Haiku (el más rápido, menos matizado)"),
+    ("fable", "Fable (el más nuevo)"),
+]
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            cfg.update(json.load(f))
+    except Exception:
+        pass
+    return cfg
+
+
+def save_config():
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(CONFIG, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log(f"could not save config: {e!r}")
+
+
+CONFIG = load_config()
+MODEL = CONFIG["model"]
+VOICE = CONFIG["voice"]
+RATE = CONFIG["rate"]
 
 # Fixed path Claude is told to use when IT decides a turn needs to see the
 # screen. We never take this screenshot ourselves -- we only watch this path
@@ -52,16 +111,15 @@ RATE = "+8%"
 # (and only when) a capture actually happens.
 SCREENSHOT_PATH = os.path.join(ASSISTANT_DIR, "current_screen.png")
 
-# ---- filler speech, so a slow turn isn't dead silence ----------------------
+# ---- filler for silence: one spoken line the first time, a looping tone -----
+# ---- for every gap after that -----------------------------------------------
 # We don't try to predict how long Claude will take (that's guessing before
-# there's anything to measure). We measure the actual silence instead: if the
-# reply still isn't ready after OPENER_DELAY, say something; then keep dropping
-# short connectors at random gaps until the real answer is ready.
+# there's anything to measure). We measure the actual silence instead: the
+# first time it runs past FIRST_GAP_DELAY, say one opener line out loud; from
+# then on, any further silence past RESUME_GAP_DELAY (between sentences, e.g.
+# while Claude is using a tool) gets the looping tone instead of more talking.
 FILLER_DIR = os.path.join(ASSISTANT_DIR, "fillers")
-OPENER_DELAY = 3.5          # seconds of silence before the first filler. With streaming, a
-                            # simple answer's first sentence is usually playing by ~4-5s, so a
-                            # filler only fires on genuinely slow turns (tool use, screenshots).
-CONNECTOR_GAP = (2.5, 5.0)  # random pause between connectors, so silence stays short
+LOOP_SOUND_PATH = os.path.join(ASSISTANT_DIR, "assets", "thinking_loop.mp3")
 
 # Note on spelling: this voice reads a bare "Mmm" letter by letter ("eme eme
 # eme"), and "Uhm" comes out as "un". Only "Hmm"/"Hmmm" produce an actual hum,
@@ -83,29 +141,6 @@ OPENERS = [
     "Vale, estoy en ello.",
     "Eso me lleva un ratito, espera.",
     "Lo estoy viendo ahora.",
-]
-
-CONNECTORS = [
-    "Hmm.",
-    "A ver.",
-    "Sigo en ello.",
-    "Un poco más.",
-    "Esto es más complejo de lo que parecía.",
-    "Ya casi lo tengo.",
-    "Dame un segundo más.",
-    "Hmmm, a ver.",
-    "Sigo mirando.",
-    "Un momentito más.",
-    "Está tardando un poco.",
-    "Ya voy.",
-    "Aquí sigo.",
-    "Vale, ya casi.",
-    "Un segundo.",
-    "Esto tiene más tela.",
-    "Sigo buscando.",
-    "Ya mismo.",
-    "Aguanta un poco.",
-    "Hmm, casi está.",
 ]
 
 import re as _re
@@ -138,16 +173,19 @@ COLORS = {
     "speaking":  (0.14, 0.55, 0.42),
 }
 
-# Flags that strip everything not needed for a quick voice question
-# (global memory, MCP servers, skill listing, Chrome integration):
-# this is what brings a turn down from ~12-14s (Opus, full context) to ~3-7s.
-FAST_FLAGS = [
-    "--model", "sonnet",
-    "--setting-sources", "",
-    "--disable-slash-commands",
-    "--strict-mcp-config",
-    "--no-chrome",
-]
+def fast_flags():
+    """Flags that strip everything not needed for a quick voice question
+    (global memory, MCP servers, skill listing, Chrome integration): this is
+    what brings a turn down from ~12-14s (Opus, full context) to ~3-7s.
+    Reads the current MODEL each call, so switching it from the right-click
+    menu takes effect on the very next turn."""
+    return [
+        "--model", MODEL,
+        "--setting-sources", "",
+        "--disable-slash-commands",
+        "--strict-mcp-config",
+        "--no-chrome",
+    ]
 
 SYSTEM_PROMPT = (
     "You are a floating voice assistant on the user's Ubuntu desktop. "
@@ -230,27 +268,22 @@ def _filler_path(kind, index):
 
 
 def ensure_fillers():
-    """Renders the filler phrases to mp3 once, in parallel. Re-renders only if
-    the phrase list changed (tracked by a manifest), so startup is free after
-    the first run."""
+    """Renders the opener phrases to mp3 once, in parallel. Re-renders only if
+    the phrase list or voice changed (tracked by a manifest), so startup is
+    free after the first run."""
     os.makedirs(FILLER_DIR, exist_ok=True)
     manifest_path = os.path.join(FILLER_DIR, "phrases.json")
-    wanted = {"openers": OPENERS, "connectors": CONNECTORS}
+    wanted = {"openers": OPENERS, "voice": VOICE, "rate": RATE}
     try:
         with open(manifest_path, encoding="utf-8") as f:
             if json.load(f) == wanted and all(
-                os.path.exists(_filler_path(k[:-1], i))
-                for k, items in wanted.items()
-                for i in range(len(items))
+                os.path.exists(_filler_path("opener", i)) for i in range(len(OPENERS))
             ):
                 return
     except Exception:
         pass
 
-    jobs = []
-    for kind, phrases in (("opener", OPENERS), ("connector", CONNECTORS)):
-        for i, phrase in enumerate(phrases):
-            jobs.append((kind, i, phrase))
+    jobs = [("opener", i, phrase) for i, phrase in enumerate(OPENERS)]
 
     def render(job):
         kind, i, phrase = job
@@ -277,69 +310,92 @@ def ensure_fillers():
     log(f"fillers rendered ({len(jobs)} phrases, {time.time()-t0:.1f}s)")
 
 
-class FillerPlayer:
-    """Speaks short filler lines while Claude is still thinking, so a slow turn
-    isn't dead air. Stops the instant the real reply is ready (or the user
-    interrupts): it never overlaps with the actual answer."""
+class GapFiller:
+    """Covers silence during a turn, driven purely by measured silence, never
+    a fixed schedule: the first time the gap runs past FIRST_GAP_DELAY, it
+    speaks one opener line ("Hmm, déjame pensar") and sets the orb back to
+    "thinking". After that, any further gap -- typically Claude pausing
+    between sentences to use a tool -- gets the short looping tone instead,
+    starting after the shorter RESUME_GAP_DELAY, for as long as the silence
+    lasts. It never overlaps real speech: SpeechPipeline calls
+    notify_audio_starting()/notify_audio_ended() around every sentence it
+    plays, which is what arms and disarms the watch."""
 
-    def __init__(self):
-        self.active = False
-        self.proc = None
-        self._last = {}
+    FIRST_GAP_DELAY = 3.5
+    RESUME_GAP_DELAY = 1.6
 
-    def _pick(self, kind, phrases):
-        """Random, but never the same line twice in a row."""
-        choices = [i for i in range(len(phrases)) if i != self._last.get(kind)]
-        idx = random.choice(choices or list(range(len(phrases))))
-        self._last[kind] = idx
-        return _filler_path(kind, idx)
+    def __init__(self, set_state):
+        self.set_state = set_state
+        self._active = False
+        self._epoch = 0
+        self._proc = None
+        self._last_opener = None
 
-    def _play(self, path):
-        if not self.active or not os.path.exists(path):
+    def arm(self):
+        """Call once per turn, right when Claude starts working."""
+        self._active = True
+        self._epoch += 1
+        self._watch(self._epoch, first=True)
+
+    def notify_audio_starting(self):
+        """Call right before a REAL sentence is about to play."""
+        self._epoch += 1  # invalidates any in-flight watch/loop
+        proc = self._proc
+        if proc and proc.poll() is None:
+            try:
+                proc.wait(timeout=1.0)  # let the current line finish its word if it's quick
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+        self._proc = None
+
+    def notify_audio_ended(self):
+        """Call right after a real sentence finishes, in case more is still coming."""
+        if self._active:
+            self._epoch += 1
+            self._watch(self._epoch, first=False)
+
+    def stop(self):
+        self._active = False
+        self._epoch += 1
+        proc = self._proc
+        if proc and proc.poll() is None:
+            proc.terminate()
+        self._proc = None
+
+    def _watch(self, my_epoch, first):
+        threading.Thread(target=self._watch_body, args=(my_epoch, first), daemon=True).start()
+
+    def _watch_body(self, my_epoch, first):
+        delay = self.FIRST_GAP_DELAY if first else self.RESUME_GAP_DELAY
+        waited = 0.0
+        while waited < delay:
+            if my_epoch != self._epoch or not self._active:
+                return
+            time.sleep(0.1)
+            waited += 0.1
+        if my_epoch != self._epoch or not self._active:
             return
-        self.proc = subprocess.Popen(
+        GLib.idle_add(self.set_state, "thinking")
+        if first:
+            self._play_once(self._pick_opener())
+        while my_epoch == self._epoch and self._active:
+            self._play_once(LOOP_SOUND_PATH)
+
+    def _pick_opener(self):
+        choices = [i for i in range(len(OPENERS)) if i != self._last_opener]
+        idx = random.choice(choices or list(range(len(OPENERS))))
+        self._last_opener = idx
+        return _filler_path("opener", idx)
+
+    def _play_once(self, path):
+        if not os.path.exists(path):
+            return
+        self._proc = subprocess.Popen(
             ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path],
             stdin=subprocess.DEVNULL,
         )
-        self.proc.wait()
-        self.proc = None
-
-    def _run(self):
-        time.sleep(OPENER_DELAY)
-        if not self.active:
-            return
-        self._play(self._pick("opener", OPENERS))
-        while self.active:
-            gap = random.uniform(*CONNECTOR_GAP)
-            waited = 0.0
-            while self.active and waited < gap:
-                time.sleep(0.15)
-                waited += 0.15
-            if not self.active:
-                return
-            self._play(self._pick("connector", CONNECTORS))
-
-    def start(self):
-        if self.active:
-            return
-        self.active = True
-        threading.Thread(target=self._run, daemon=True).start()
-
-    def stop(self, wait=False):
-        """wait=True lets the line currently playing finish (so the real answer
-        doesn't cut it off mid-word); wait=False kills it instantly, which is
-        what a user interruption needs."""
-        self.active = False
-        proc = self.proc
-        if proc and proc.poll() is None:
-            if wait:
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.terminate()
-            else:
-                proc.terminate()
-        self.proc = None
+        self._proc.wait()
+        self._proc = None
 
 
 def synth_sentence(text, out_path, timeout=8.0):
@@ -399,9 +455,9 @@ class SpeechPipeline:
     starts writing, instead of waiting for the whole reply to be written AND
     fully synthesized."""
 
-    def __init__(self, orb, filler, set_state):
+    def __init__(self, orb, gap, set_state):
         self.orb = orb
-        self.filler = filler
+        self.gap = gap
         self.set_state = set_state
         self.sentences = queue.Queue()
         self.ready = queue.Queue()
@@ -463,10 +519,11 @@ class SpeechPipeline:
                 if first:
                     first = False
                     self.first_audio_at = time.time() - self._t0
-                    # the real answer is here: let a filler line finish its word, then take over
-                    self.filler.stop(wait=True)
-                    if self.cancelled:
-                        return
+                # a real sentence is about to play: let any filler line or loop tone
+                # finish its current beat, then take over. Never overlaps.
+                self.gap.notify_audio_starting()
+                if self.cancelled:
+                    return
                 GLib.idle_add(lambda e=env, s=step: (self.set_state("speaking"),
                                                      self.orb.start_speaking(e, s)))
                 self.proc = subprocess.Popen(
@@ -475,6 +532,9 @@ class SpeechPipeline:
                 )
                 self.proc.wait()
                 self.proc = None
+                # if Claude pauses again (e.g. to use a tool) before the next sentence
+                # is ready, this re-arms the gap watch so the loop tone can resume
+                self.gap.notify_audio_ended()
                 try:
                     os.remove(mp3)
                 except OSError:
@@ -554,6 +614,10 @@ class Orb(Gtk.DrawingArea):
     def _set_hover(self, v):
         self.hover = v
         self.queue_draw()
+        win = self.get_window()
+        if win:
+            name = "pointer" if v else "default"
+            win.set_cursor(Gdk.Cursor.new_from_name(Gdk.Display.get_default(), name))
 
     def set_state(self, state):
         self.state = state
@@ -738,7 +802,12 @@ class WalkieButton(Gtk.Window):
             log("warning: no compositing, transparency won't look right")
 
         geo = Gdk.Display.get_default().get_monitor(0).get_geometry()
-        self.move(geo.width - SIZE - 46, geo.height - SIZE - 96)
+        if CONFIG.get("pos_x") is not None and CONFIG.get("pos_y") is not None:
+            self.move(CONFIG["pos_x"], CONFIG["pos_y"])
+        else:
+            self.move(geo.width - SIZE - 46, geo.height - SIZE - 96)
+        self._pos_save_timer = None
+        self.connect("configure-event", self._on_configure)
 
         self.orb = Orb()
         self.add(self.orb)
@@ -753,13 +822,83 @@ class WalkieButton(Gtk.Window):
         self.claude_proc = None
         self.pipeline = None
 
-        self.filler = FillerPlayer()
+        self.gap = GapFiller(self.set_state)
 
         self.whisper_model = None
         threading.Thread(target=self.load_whisper, daemon=True).start()
         threading.Thread(target=ensure_fillers, daemon=True).start()
 
-        log("=== started (sonnet model, fast flags) ===")
+        log(f"=== started (model={MODEL}, voice={VOICE}, rate={RATE}) ===")
+
+    # ---------- position: middle-click drag, persisted ----------
+    def _on_configure(self, widget, event):
+        if self._pos_save_timer:
+            GLib.source_remove(self._pos_save_timer)
+        self._pos_save_timer = GLib.timeout_add(500, self._save_position)
+
+    def _save_position(self):
+        x, y = self.get_position()
+        CONFIG["pos_x"], CONFIG["pos_y"] = x, y
+        save_config()
+        self._pos_save_timer = None
+        return False
+
+    # ---------- right-click menu: model / voice / speed ----------
+    def _build_menu(self):
+        menu = Gtk.Menu()
+
+        def submenu(title, choices, current, on_pick):
+            item = Gtk.MenuItem(label=title)
+            sub = Gtk.Menu()
+            group = None
+            for value, label in choices:
+                mi = Gtk.RadioMenuItem.new_with_label_from_widget(group, label)
+                group = mi
+                if value == current:
+                    mi.set_active(True)
+                mi.connect("toggled", lambda w, v=value: w.get_active() and on_pick(v))
+                sub.append(mi)
+            item.set_submenu(sub)
+            menu.append(item)
+
+        def pick_model(v):
+            global MODEL
+            MODEL = v
+            CONFIG["model"] = v
+            save_config()
+            log(f"model switched to {v}")
+
+        def pick_voice(v):
+            global VOICE
+            VOICE = v
+            CONFIG["voice"] = v
+            save_config()
+            log(f"voice switched to {v}")
+            threading.Thread(target=ensure_fillers, daemon=True).start()
+
+        def pick_rate(v):
+            global RATE
+            RATE = v
+            CONFIG["rate"] = v
+            save_config()
+            log(f"rate switched to {v}")
+            threading.Thread(target=ensure_fillers, daemon=True).start()
+
+        submenu("Modelo", MODEL_CHOICES, MODEL, pick_model)
+        submenu("Voz", VOICE_CHOICES, VOICE, pick_voice)
+        submenu("Velocidad", RATE_CHOICES, RATE, pick_rate)
+
+        menu.append(Gtk.SeparatorMenuItem())
+        reset_item = Gtk.MenuItem(label="Volver a la esquina inferior derecha")
+        reset_item.connect("activate", lambda w: self._reset_position())
+        menu.append(reset_item)
+
+        menu.show_all()
+        return menu
+
+    def _reset_position(self):
+        geo = Gdk.Display.get_default().get_monitor(0).get_geometry()
+        self.move(geo.width - SIZE - 46, geo.height - SIZE - 96)
 
     def set_state(self, state):
         self.orb.set_state(state)
@@ -790,15 +929,22 @@ class WalkieButton(Gtk.Window):
         """Barge-in: kill everything the current turn is doing, instantly.
         With streaming, Claude may still be writing while we're already
         speaking, so all three are stopped regardless of the visible state."""
-        self.filler.stop()
+        self.gap.stop()
         pipeline = self.pipeline
         if pipeline:
             pipeline.cancel()
         if self.claude_proc and self.claude_proc.poll() is None:
             self.claude_proc.terminate()
 
-    # ---------- recording ----------
+    # ---------- recording (left button) / drag (middle) / menu (right) ----------
     def on_press(self, widget, event):
+        if event.button == 2:  # middle click: grab and move the orb anywhere
+            self.begin_move_drag(event.button, int(event.x_root), int(event.y_root), event.time)
+            return True
+        if event.button == 3:  # right click: model / voice / speed
+            self._build_menu().popup_at_pointer(event)
+            return True
+
         if self.whisper_model is None or self.orb.state == "recording":
             return True
         self.orb.pressed = True
@@ -853,7 +999,7 @@ class WalkieButton(Gtk.Window):
                 f"{SCREENSHOT_PATH}` via Bash, then read that file. Skip it otherwise.)"
             )
             cmd = ["claude", "-p", prompt, "--permission-mode", "bypassPermissions",
-                   "--append-system-prompt", SYSTEM_PROMPT] + FAST_FLAGS
+                   "--append-system-prompt", SYSTEM_PROMPT] + fast_flags()
             if self.session_started:
                 cmd += ["--resume", self.session_id]
             else:
@@ -875,8 +1021,8 @@ class WalkieButton(Gtk.Window):
             # the red frame the moment (and only the moments) it actually captures something.
             threading.Thread(target=self._watch_for_capture, args=(self.claude_proc,), daemon=True).start()
             # fills the silence until the first real sentence is ready to play
-            self.filler.start()
-            pipeline = SpeechPipeline(self.orb, self.filler, self.set_state)
+            self.gap.arm()
+            pipeline = SpeechPipeline(self.orb, self.gap, self.set_state)
             self.pipeline = pipeline
             pipeline.start()
 
@@ -941,7 +1087,7 @@ class WalkieButton(Gtk.Window):
         except Exception as e:
             log(f"EXCEPTION turn {my_turn}: {e!r}")
         finally:
-            self.filler.stop()
+            self.gap.stop()
             if superseded() and self.pipeline:
                 self.pipeline.cancel()
             if os.path.exists(SCREENSHOT_PATH):
