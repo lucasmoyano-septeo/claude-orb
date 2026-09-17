@@ -81,14 +81,29 @@ taskbar.
 
 ## Why it's fast (or why it isn't)
 
-The turn uses `--model sonnet` plus several flags that strip out what a
-quick voice question doesn't need (memory/CLAUDE.md, MCP servers, skill
-listing, Chrome integration). With that, a simple question with no
-screenshot gets an answer in 3 to 6 seconds. With a screenshot, a bit more,
-because the model has to actually read the image. And if Claude decides to
-use its tools on its own (look at something more carefully, move the
-mouse), it takes as long as it actually takes — that's not a bottleneck
-flags can fix, it's the price of giving it freedom to act.
+Three things, in order of impact:
+
+1. **Streaming, sentence by sentence.** Claude's text is read as it is
+   being written (`--output-format stream-json`). Each complete sentence is
+   synthesized the moment it exists and played in order while the next ones
+   are still being generated. You hear the first sentence about 5 seconds
+   after releasing the button, instead of waiting for the whole reply to be
+   written *and* fully synthesized (which used to be 9-10 seconds).
+2. **A lean Claude session.** `--model sonnet` plus flags that strip out
+   what a quick voice question doesn't need: memory/CLAUDE.md, MCP servers,
+   skill listing, Chrome integration.
+3. **In-process synthesis with a hard timeout.** The edge-tts cloud has very
+   uneven latency (the same sentence measured 20 s once and 1.4 s the next
+   time). Every sentence is synthesized in-process, with an 8 s timeout and
+   one retry, so one slow call never stalls the whole reply.
+
+While Claude is still thinking, short filler lines ("Hmm, déjame pensar",
+"Sigo en ello") cover the silence, and stop the moment the first real
+sentence is ready. They only kick in on turns that are actually slow.
+
+What flags can't fix: if Claude decides to use its tools (take a
+screenshot, move the mouse), the turn takes as long as that takes. That's
+the price of giving it freedom to act, not a bottleneck.
 
 ## Structure
 

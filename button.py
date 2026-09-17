@@ -17,18 +17,26 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GLib, Gdk
 
+import asyncio
 import audioop
 import cairo
 import json
 import math
 import os
+import queue
 import random
+import re
 import subprocess
 import tempfile
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+
+try:
+    import edge_tts  # in-process synthesis: no interpreter start-up per sentence
+except ImportError:  # falls back to the CLI, slower but works
+    edge_tts = None
 
 HOME = os.path.expanduser("~")
 ASSISTANT_DIR = os.path.join(HOME, ".claude", "floating-assistant")
@@ -50,7 +58,9 @@ SCREENSHOT_PATH = os.path.join(ASSISTANT_DIR, "current_screen.png")
 # reply still isn't ready after OPENER_DELAY, say something; then keep dropping
 # short connectors at random gaps until the real answer is ready.
 FILLER_DIR = os.path.join(ASSISTANT_DIR, "fillers")
-OPENER_DELAY = 1.8          # seconds of silence before the first filler
+OPENER_DELAY = 3.5          # seconds of silence before the first filler. With streaming, a
+                            # simple answer's first sentence is usually playing by ~4-5s, so a
+                            # filler only fires on genuinely slow turns (tool use, screenshots).
 CONNECTOR_GAP = (2.5, 5.0)  # random pause between connectors, so silence stays short
 
 # Note on spelling: this voice reads a bare "Mmm" letter by letter ("eme eme
@@ -332,6 +342,155 @@ class FillerPlayer:
         self.proc = None
 
 
+def synth_sentence(text, out_path, timeout=8.0):
+    """Renders one sentence to mp3. The edge-tts cloud has very uneven latency
+    (measured: the same line took 20s once and 1.4s the next time), so every
+    call gets a hard timeout and one retry -- a hung call must never stall
+    the whole reply. Returns True on success."""
+    for attempt in (1, 2):
+        try:
+            if edge_tts is not None:
+                async def run():
+                    comm = edge_tts.Communicate(text, VOICE, rate=RATE)
+                    with open(out_path, "wb") as f:
+                        async for chunk in comm.stream():
+                            if chunk["type"] == "audio":
+                                f.write(chunk["data"])
+                asyncio.run(asyncio.wait_for(run(), timeout))
+            else:
+                txt = out_path + ".txt"
+                with open(txt, "w", encoding="utf-8") as f:
+                    f.write(text)
+                subprocess.run([EDGE_TTS, "--voice", VOICE, f"--rate={RATE}", "--file", txt,
+                                "--write-media", out_path],
+                               check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=timeout)
+                os.remove(txt)
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                return True
+        except Exception as e:
+            log(f"tts attempt {attempt} failed for {text[:40]!r}: {e!r}")
+    return False
+
+
+# A sentence ends at . ! ? … followed by whitespace/end (so "3.5" is not split),
+# or at a line break. Short fragments are merged with the next sentence so we
+# don't fire the synthesizer for a two-word stub.
+_SENTENCE_END = re.compile(r"[.!?…]+(?:\s+|$)|\n+")
+
+
+def split_ready_sentences(buf, min_len=25):
+    """Returns (complete_sentences, remaining_text) from a streaming buffer."""
+    ready = []
+    start = 0
+    for m in _SENTENCE_END.finditer(buf):
+        seg = buf[start:m.end()].strip()
+        if len(seg) >= min_len:
+            ready.append(seg)
+            start = m.end()
+    return ready, buf[start:]
+
+
+class SpeechPipeline:
+    """Sentence-level streaming speech. Claude's text comes in as it is
+    generated; each complete sentence is synthesized as soon as it exists and
+    played in order, while the next ones are synthesized in the background.
+    The listener hears the first sentence a couple of seconds after Claude
+    starts writing, instead of waiting for the whole reply to be written AND
+    fully synthesized."""
+
+    def __init__(self, orb, filler, set_state):
+        self.orb = orb
+        self.filler = filler
+        self.set_state = set_state
+        self.sentences = queue.Queue()
+        self.ready = queue.Queue()
+        self.cancelled = False
+        self.proc = None
+        self.first_audio_at = None
+        self.done = threading.Event()
+        self._t0 = time.time()
+
+    def start(self):
+        threading.Thread(target=self._synth_loop, daemon=True).start()
+        threading.Thread(target=self._play_loop, daemon=True).start()
+
+    def feed(self, sentence):
+        if not self.cancelled:
+            self.sentences.put(sentence)
+
+    def finish(self):
+        self.sentences.put(None)
+
+    def cancel(self):
+        self.cancelled = True
+        proc = self.proc
+        if proc and proc.poll() is None:
+            proc.terminate()
+        self.sentences.put(None)
+        self.ready.put(None)
+
+    def wait(self, timeout=None):
+        return self.done.wait(timeout)
+
+    def _synth_loop(self):
+        while True:
+            sentence = self.sentences.get()
+            if sentence is None or self.cancelled:
+                self.ready.put(None)
+                return
+            clean = clean_for_speech(sentence)
+            if not clean:
+                continue
+            mp3 = tempfile.mktemp(suffix=".mp3", dir=ASSISTANT_DIR)
+            if synth_sentence(clean, mp3) and not self.cancelled:
+                env, step = compute_envelope(mp3)
+                self.ready.put((mp3, env, step))
+            else:
+                try:
+                    os.remove(mp3)
+                except OSError:
+                    pass
+
+    def _play_loop(self):
+        first = True
+        try:
+            while True:
+                item = self.ready.get()
+                if item is None or self.cancelled:
+                    return
+                mp3, env, step = item
+                if first:
+                    first = False
+                    self.first_audio_at = time.time() - self._t0
+                    # the real answer is here: let a filler line finish its word, then take over
+                    self.filler.stop(wait=True)
+                    if self.cancelled:
+                        return
+                GLib.idle_add(lambda e=env, s=step: (self.set_state("speaking"),
+                                                     self.orb.start_speaking(e, s)))
+                self.proc = subprocess.Popen(
+                    ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", mp3],
+                    stdin=subprocess.DEVNULL,
+                )
+                self.proc.wait()
+                self.proc = None
+                try:
+                    os.remove(mp3)
+                except OSError:
+                    pass
+        finally:
+            # drop anything still queued (cancelled mid-way)
+            while not self.ready.empty():
+                try:
+                    item = self.ready.get_nowait()
+                    if item:
+                        os.remove(item[0])
+                except Exception:
+                    pass
+            self.done.set()
+
+
 def compute_envelope(mp3_path, window_ms=60, sample_rate=16000):
     """Real volume envelope of the audio (RMS per window), normalized 0..1.
     Lets the orb move with the actual voice, not with a made-up pattern."""
@@ -592,7 +751,7 @@ class WalkieButton(Gtk.Window):
         self.wav_path = None
         self.current_turn = 0
         self.claude_proc = None
-        self.tts_proc = None
+        self.pipeline = None
 
         self.filler = FillerPlayer()
 
@@ -627,13 +786,14 @@ class WalkieButton(Gtk.Window):
                     GLib.idle_add(flash_capture_indicator)
 
     # ---------- interruptions ----------
-    def _stop_tts(self):
+    def _abort_turn(self):
+        """Barge-in: kill everything the current turn is doing, instantly.
+        With streaming, Claude may still be writing while we're already
+        speaking, so all three are stopped regardless of the visible state."""
         self.filler.stop()
-        if self.tts_proc and self.tts_proc.poll() is None:
-            self.tts_proc.terminate()
-
-    def _kill_claude(self):
-        self.filler.stop()
+        pipeline = self.pipeline
+        if pipeline:
+            pipeline.cancel()
         if self.claude_proc and self.claude_proc.poll() is None:
             self.claude_proc.terminate()
 
@@ -642,10 +802,8 @@ class WalkieButton(Gtk.Window):
         if self.whisper_model is None or self.orb.state == "recording":
             return True
         self.orb.pressed = True
-        if self.orb.state == "speaking":
-            self._stop_tts()
-        elif self.orb.state == "thinking":
-            self._kill_claude()
+        if self.orb.state in ("speaking", "thinking"):
+            self._abort_turn()
 
         self.current_turn += 1
         self.wav_path = tempfile.mktemp(suffix=".wav", dir=ASSISTANT_DIR)
@@ -703,47 +861,89 @@ class WalkieButton(Gtk.Window):
 
             if superseded():
                 return
+            # Streaming: Claude's text arrives as it is written. Each complete sentence
+            # goes straight to the speech pipeline, which synthesizes and plays it while
+            # the next ones are still being generated. Time-to-first-audio is "first
+            # sentence written + one sentence synthesized", not "whole reply written +
+            # whole reply synthesized".
+            cmd += ["--output-format", "stream-json", "--include-partial-messages", "--verbose"]
             t0 = time.time()
-            self.claude_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stderr_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+            self.claude_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=stderr_file, text=True)
             # Claude decides per turn whether it needs to look at the screen. We never take a
             # screenshot ourselves; we just watch the fixed path it's told to write to, and flash
             # the red frame the moment (and only the moments) it actually captures something.
             threading.Thread(target=self._watch_for_capture, args=(self.claude_proc,), daemon=True).start()
-            # fills the silence if this turn turns out to be slow; stops the
-            # moment there's a real answer to speak
+            # fills the silence until the first real sentence is ready to play
             self.filler.start()
-            stdout, stderr = self.claude_proc.communicate(timeout=90)
+            pipeline = SpeechPipeline(self.orb, self.filler, self.set_state)
+            self.pipeline = pipeline
+            pipeline.start()
+
+            buf, full_text, result_text = "", "", None
+            first_sentence_at = None
+            for line in self.claude_proc.stdout:
+                if superseded():
+                    break
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if ev.get("type") == "stream_event":
+                    e = ev.get("event", {})
+                    if e.get("type") == "content_block_delta" and e.get("delta", {}).get("type") == "text_delta":
+                        piece = e["delta"]["text"]
+                        buf += piece
+                        full_text += piece
+                        ready, buf = split_ready_sentences(buf)
+                        for s in ready:
+                            if first_sentence_at is None:
+                                first_sentence_at = time.time() - t0
+                            pipeline.feed(s)
+                elif ev.get("type") == "result":
+                    result_text = ev.get("result") or ""
+
+            self.claude_proc.wait(timeout=10)
             rc = self.claude_proc.returncode
             self.claude_proc = None
-            # note: the filler keeps talking on purpose until the reply audio is
-            # actually ready to play (generating it takes a couple of seconds too)
 
-            if rc is not None and rc < 0:
-                log(f"turn {my_turn} interrupted mid-Claude")
-                return
-            if superseded():
-                log(f"turn {my_turn} discarded (got a stale reply)")
+            if (rc is not None and rc < 0) or superseded():
+                log(f"turn {my_turn} interrupted/discarded")
+                pipeline.cancel()
                 return
 
-            reply = stdout.strip()
             if rc != 0:
-                log(f"claude ERROR: {stderr[:500]}")
-                reply = "Hubo un error al procesar eso."
+                stderr_file.seek(0)
+                log(f"claude ERROR: {stderr_file.read()[:500]}")
+                pipeline.feed("Hubo un error al procesar eso.")
             else:
                 self.session_started = True
-            log(f"claude replied ({time.time()-t0:.1f}s, turn {my_turn}): {reply!r}")
+                if not full_text and result_text:
+                    # no deltas came through (shouldn't happen) -- speak the final result instead
+                    full_text = result_text
+                    ready, buf = split_ready_sentences(result_text)
+                    for s in ready:
+                        pipeline.feed(s)
+                if buf.strip():
+                    pipeline.feed(buf.strip())
+            stderr_file.close()
+            pipeline.finish()
 
-            for junk in ("```", "**"):
-                reply = reply.replace(junk, "")
+            log(f"claude done ({time.time()-t0:.1f}s, first sentence at "
+                f"{first_sentence_at if first_sentence_at is None else round(first_sentence_at, 1)}s, "
+                f"turn {my_turn}): {full_text[:300]!r}")
 
-            if superseded() or not reply:
-                return
-            self._speak(reply, my_turn, superseded)
+            pipeline.wait()
+            if pipeline.first_audio_at is not None:
+                log(f"first audio played at {pipeline.first_audio_at:.1f}s after Claude started (turn {my_turn})")
+            self.pipeline = None
 
         except Exception as e:
             log(f"EXCEPTION turn {my_turn}: {e!r}")
         finally:
             self.filler.stop()
+            if superseded() and self.pipeline:
+                self.pipeline.cancel()
             if os.path.exists(SCREENSHOT_PATH):
                 try:
                     os.remove(SCREENSHOT_PATH)
@@ -755,46 +955,6 @@ class WalkieButton(Gtk.Window):
                 pass
             if not superseded():
                 GLib.idle_add(self.set_state, "idle")
-
-    # ---------- spoken output, with the orb synced to the real audio ----------
-    def _speak(self, text, my_turn, superseded):
-        clean_txt = tempfile.mktemp(suffix=".txt", dir=ASSISTANT_DIR)
-        mp3_path = tempfile.mktemp(suffix=".mp3", dir=ASSISTANT_DIR)
-        try:
-            with open(clean_txt, "w", encoding="utf-8") as f:
-                f.write(clean_for_speech(text))
-
-            if superseded():
-                return
-            t0 = time.time()
-            subprocess.run(
-                [EDGE_TTS, "--voice", VOICE, f"--rate={RATE}", "--file", clean_txt, "--write-media", mp3_path],
-                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
-            )
-            log(f"tts generated ({time.time()-t0:.1f}s, turn {my_turn})")
-            if superseded() or not os.path.exists(mp3_path) or os.path.getsize(mp3_path) == 0:
-                return
-
-            envelope, step_ms = compute_envelope(mp3_path)
-            if superseded():
-                return
-
-            # the reply audio is ready now: let any filler line finish its word,
-            # then take over. They never overlap.
-            self.filler.stop(wait=True)
-            GLib.idle_add(lambda: (self.set_state("speaking"), self.orb.start_speaking(envelope, step_ms)))
-            self.tts_proc = subprocess.Popen(
-                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", mp3_path],
-                stdin=subprocess.DEVNULL,
-            )
-            self.tts_proc.wait()
-            self.tts_proc = None
-        finally:
-            for p in (clean_txt, mp3_path):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
 
 
 if __name__ == "__main__":
