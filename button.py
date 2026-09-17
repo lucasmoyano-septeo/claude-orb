@@ -2,11 +2,13 @@
 """
 Floating walkie-talkie button to talk to Claude Code by voice.
 
-Press and hold -> records. Release -> transcribes (while taking a screenshot
-at the same time), sends it all to a fast Claude Code session (Sonnet, no
-extra memory/MCP/skills) with free permission to use xdotool/import via
-Bash, and reads the reply out loud with edge-tts while the orb moves at the
-real rhythm of the audio (not a decorative animation).
+Press and hold -> records. Release -> transcribes, then sends it to a fast
+Claude Code session (Sonnet, no extra memory/MCP/skills) with free
+permission to use xdotool/import via Bash. Claude itself decides, per turn,
+whether it needs to look at the screen -- there's no automatic screenshot on
+every turn, only when it actually takes one. It reads the reply out loud
+with edge-tts while the orb moves at the real rhythm of the audio (not a
+decorative animation).
 
 Pressing while it's speaking or thinking interrupts it instantly and starts
 recording a new question (barge-in).
@@ -32,6 +34,12 @@ LOG_PATH = os.path.join(ASSISTANT_DIR, "assistant.log")
 EDGE_TTS = os.path.join(ASSISTANT_DIR, "venv", "bin", "edge-tts")
 VOICE = "es-ES-ElviraNeural"
 RATE = "+8%"
+
+# Fixed path Claude is told to use when IT decides a turn needs to see the
+# screen. We never take this screenshot ourselves -- we only watch this path
+# for changes while Claude is working, so the red flash fires exactly when
+# (and only when) a capture actually happens.
+SCREENSHOT_PATH = os.path.join(ASSISTANT_DIR, "current_screen.png")
 
 import re as _re
 import unicodedata as _unicodedata
@@ -76,8 +84,13 @@ FAST_FLAGS = [
 
 SYSTEM_PROMPT = (
     "You are a floating voice assistant on the user's Ubuntu desktop. "
-    "On every turn you get what they said by voice and a screenshot taken at that instant; "
-    "read it with your file-reading tool before answering if it could be relevant. "
+    "On every turn you get what they said by voice. You do NOT get a screenshot automatically -- "
+    "decide for yourself, per turn, whether the question needs to see their screen. Most short "
+    "voice questions don't. Only when it genuinely does (they say things like 'this', 'what I have "
+    "open', 'what I'm looking at', ask about something visual, or you simply can't answer well from "
+    "the words alone), take one yourself by running this exact command via Bash: "
+    f"import -window root -resize 1280x {SCREENSHOT_PATH} -- then read that file with your file-reading "
+    "tool before answering. Skip this entirely for anything you can already answer from the spoken text. "
     "You have xdotool (move/click the mouse, type, press keys) and import (screenshots) available via Bash, "
     "with full freedom to use them without asking for confirmation whenever it helps answer or act for the user. "
     "Always reply in Spanish, since the user speaks Spanish. "
@@ -422,6 +435,20 @@ class WalkieButton(Gtk.Window):
         log(f"whisper loaded in {time.time()-t0:.1f}s")
         GLib.idle_add(self.set_state, "idle")
 
+    # ---------- watch whether Claude decides to take a screenshot ----------
+    def _watch_for_capture(self, proc):
+        """Polls SCREENSHOT_PATH's mtime while `proc` (the claude subprocess) is alive.
+        Flashes the red frame the moment it detects Claude actually wrote a new capture --
+        never on a fixed schedule, only on real writes."""
+        seen_mtime = os.path.getmtime(SCREENSHOT_PATH) if os.path.exists(SCREENSHOT_PATH) else None
+        while proc.poll() is None:
+            time.sleep(0.15)
+            if os.path.exists(SCREENSHOT_PATH):
+                mtime = os.path.getmtime(SCREENSHOT_PATH)
+                if mtime != seen_mtime:
+                    seen_mtime = mtime
+                    GLib.idle_add(flash_capture_indicator)
+
     # ---------- interruptions ----------
     def _stop_tts(self):
         if self.tts_proc and self.tts_proc.poll() is None:
@@ -470,35 +497,23 @@ class WalkieButton(Gtk.Window):
         def superseded():
             return my_turn != self.current_turn
 
-        screenshot_path = None
         try:
             size = os.path.getsize(wav_path) if os.path.exists(wav_path) else 0
             if size < 8000:
                 log("clip too short, ignoring")
                 return
 
-            # screenshot in parallel with transcription, not in series
-            screenshot_path = tempfile.mktemp(suffix=".png", dir=ASSISTANT_DIR)
-            shot_proc = subprocess.Popen(
-                ["import", "-window", "root", "-silent", "-resize", "1280x", screenshot_path],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-
             t0 = time.time()
             segments, info = self.whisper_model.transcribe(wav_path, language="es")
             text = " ".join(s.text for s in segments).strip()
-            shot_proc.wait(timeout=10)
-            log(f"transcribed+captured ({time.time()-t0:.1f}s, turn {my_turn}): {text!r}")
+            log(f"transcribed ({time.time()-t0:.1f}s, turn {my_turn}): {text!r}")
             if not text or superseded():
                 return
 
-            # the red frame is drawn NOW, after the screenshot already exists on disk,
-            # so the frame itself never shows up inside the image Claude is going to read
-            GLib.idle_add(flash_capture_indicator)
-
             prompt = (
                 f"The user says by voice: \"{text}\"\n\n"
-                f"Screenshot of their screen at this instant: {screenshot_path}"
+                f"(Only if you need to see their screen: run `import -window root -resize 1280x "
+                f"{SCREENSHOT_PATH}` via Bash, then read that file. Skip it otherwise.)"
             )
             cmd = ["claude", "-p", prompt, "--permission-mode", "bypassPermissions",
                    "--append-system-prompt", SYSTEM_PROMPT] + FAST_FLAGS
@@ -511,6 +526,10 @@ class WalkieButton(Gtk.Window):
                 return
             t0 = time.time()
             self.claude_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            # Claude decides per turn whether it needs to look at the screen. We never take a
+            # screenshot ourselves; we just watch the fixed path it's told to write to, and flash
+            # the red frame the moment (and only the moments) it actually captures something.
+            threading.Thread(target=self._watch_for_capture, args=(self.claude_proc,), daemon=True).start()
             stdout, stderr = self.claude_proc.communicate(timeout=90)
             rc = self.claude_proc.returncode
             self.claude_proc = None
@@ -540,9 +559,9 @@ class WalkieButton(Gtk.Window):
         except Exception as e:
             log(f"EXCEPTION turn {my_turn}: {e!r}")
         finally:
-            if screenshot_path:
+            if os.path.exists(SCREENSHOT_PATH):
                 try:
-                    os.remove(screenshot_path)
+                    os.remove(SCREENSHOT_PATH)
                 except OSError:
                     pass
             try:
