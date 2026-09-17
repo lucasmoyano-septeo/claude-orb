@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Botón flotante tipo walkie-talkie para hablar con Claude Code.
+Floating walkie-talkie button to talk to Claude Code by voice.
 
-Mantener pulsado -> graba. Soltar -> transcribe (a la vez que hace la captura
-de pantalla), se lo manda a una sesión de Claude Code rápida (Sonnet, sin
-memoria/MCP/skills de más) con permiso libre para usar xdotool/import por
-Bash, y lee la respuesta en voz con edge-tts mientras el orbe se mueve al
-ritmo real del audio (no una animación decorativa).
+Press and hold -> records. Release -> transcribes (while taking a screenshot
+at the same time), sends it all to a fast Claude Code session (Sonnet, no
+extra memory/MCP/skills) with free permission to use xdotool/import via
+Bash, and reads the reply out loud with edge-tts while the orb moves at the
+real rhythm of the audio (not a decorative animation).
 
-Pulsar mientras habla o piensa lo interrumpe al instante y empieza a grabar
-una nueva pregunta (barge-in).
+Pressing while it's speaking or thinking interrupts it instantly and starts
+recording a new question (barge-in).
 """
 import gi
 gi.require_version("Gtk", "3.0")
@@ -38,9 +38,9 @@ import unicodedata as _unicodedata
 
 
 def clean_for_speech(text):
-    """Quita lo que no se puede leer en voz alta (markdown, enlaces, símbolos raros).
-    Es una red de seguridad: el system prompt ya le pide a Claude texto plano,
-    esto cubre lo que se le escape."""
+    """Strips what can't be read out loud (markdown, links, odd symbols).
+    This is a safety net: the system prompt already asks Claude for plain
+    text, this catches whatever slips through."""
     t = text
     t = _re.sub(r"```.*?```", " ", t, flags=_re.S)
     t = _re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", t)
@@ -48,7 +48,7 @@ def clean_for_speech(text):
     t = _re.sub(r"https?://\S+", " ", t)
     t = t.replace("**", "").replace("__", "")
     t = _re.sub(r"`([^`]*)`", r"\1", t)
-    t = t.replace("→", ", ").replace("←", " desde ")
+    t = t.replace("→", ", ").replace("←", " from ")
     t = "".join(c for c in t if _unicodedata.category(c)[0] != "S" or c in "+=<>")
     t = _re.sub(r"[ \t]+", " ", t).strip()
     return t
@@ -63,9 +63,9 @@ COLORS = {
     "speaking":  (0.14, 0.55, 0.42),
 }
 
-# Flags que quitan todo lo que no hace falta para una pregunta rápida de voz
-# (memoria global, MCP servers, listado de skills, integración de Chrome):
-# esto es lo que baja el turno de ~12-14s (Opus, contexto completo) a ~3-7s.
+# Flags that strip everything not needed for a quick voice question
+# (global memory, MCP servers, skill listing, Chrome integration):
+# this is what brings a turn down from ~12-14s (Opus, full context) to ~3-7s.
 FAST_FLAGS = [
     "--model", "sonnet",
     "--setting-sources", "",
@@ -75,18 +75,19 @@ FAST_FLAGS = [
 ]
 
 SYSTEM_PROMPT = (
-    "Eres un asistente de voz flotante en el escritorio Ubuntu del usuario. "
-    "En cada turno recibes lo que dijo por voz y una captura de pantalla tomada en ese instante; "
-    "léela con tu herramienta de lectura antes de responder si puede ser relevante. "
-    "Tienes xdotool (mover/clicar el ratón, escribir, teclas) e import (capturas) disponibles vía Bash, "
-    "con libertad total para usarlos sin pedir confirmación cuando ayude a responder o a actuar por el usuario. "
-    "Responde siempre muy breve -- 1 a 3 frases -- porque esto se lee en voz alta, no se lee en pantalla. "
-    "Y responde siempre SUMAMENTE CLARO: como si le explicaras a una persona junior que acaba de entrar a la "
-    "empresa hoy y no conoce nada del proyecto. Nunca asumas que conoce nombres de clases, siglas del equipo, "
-    "ni jerga interna sin explicarla en la misma frase. Palabras simples, una idea por frase, cero ambigüedad. "
-    "Corto y clarísimo son igual de importantes: nunca sacrifiques uno por el otro. "
-    "Nunca uses markdown, backticks, asteriscos ni bloques de código: solo texto plano hablable. "
-    "No añadas ninguna línea de resumen ni la etiqueta RESUMEN: en esta herramienta."
+    "You are a floating voice assistant on the user's Ubuntu desktop. "
+    "On every turn you get what they said by voice and a screenshot taken at that instant; "
+    "read it with your file-reading tool before answering if it could be relevant. "
+    "You have xdotool (move/click the mouse, type, press keys) and import (screenshots) available via Bash, "
+    "with full freedom to use them without asking for confirmation whenever it helps answer or act for the user. "
+    "Always reply in Spanish, since the user speaks Spanish. "
+    "Always answer very briefly -- 1 to 3 sentences -- because this gets read out loud, not read on screen. "
+    "And always answer EXTREMELY CLEARLY: as if explaining to a junior person who just joined the company "
+    "today and knows nothing about the project. Never assume they know class names, team acronyms, or "
+    "internal jargon without explaining it in the same sentence. Simple words, one idea per sentence, "
+    "zero ambiguity. Short and crystal-clear matter equally: never trade one off for the other. "
+    "Never use markdown, backticks, asterisks or code blocks: plain speakable text only. "
+    "Do not add any summary line or the RESUMEN: label in this tool."
 )
 
 
@@ -96,10 +97,10 @@ def log(msg):
 
 
 class CaptureFlash(Gtk.Window):
-    """Marco rojo que cubre toda la pantalla medio segundo justo después de
-    tomar una captura, para que quede claro en qué momento Claude "miró".
-    Se dibuja DESPUÉS de capturar (nunca antes), así el marco nunca contamina
-    la propia captura. No bloquea clics: el área es transparente a eventos."""
+    """Red frame covering the whole screen for half a second right after
+    taking a screenshot, so it's clear exactly when Claude "looked". It is
+    drawn AFTER capturing (never before), so the frame never contaminates
+    the capture itself. It doesn't block clicks: the area is click-through."""
 
     def __init__(self):
         super().__init__(type=Gtk.WindowType.POPUP)
@@ -145,8 +146,8 @@ def flash_capture_indicator(duration_ms=420):
 
 
 def compute_envelope(mp3_path, window_ms=60, sample_rate=16000):
-    """Envolvente de volumen real del audio (RMS por ventana), normalizada 0..1.
-    Sirve para que el orbe se mueva con la voz de verdad, no con un patrón inventado."""
+    """Real volume envelope of the audio (RMS per window), normalized 0..1.
+    Lets the orb move with the actual voice, not with a made-up pattern."""
     try:
         proc = subprocess.run(
             ["ffmpeg", "-v", "quiet", "-i", mp3_path, "-ar", str(sample_rate), "-ac", "1", "-f", "s16le", "pipe:1"],
@@ -264,7 +265,7 @@ class Orb(Gtk.DrawingArea):
             pulse = (math.sin(t * 2.2) + 1) / 2
             radius = BASE_R + pulse * 2.0
             fill_a = 0.80
-        else:  # speaking -- el radio respira con el volumen REAL del audio
+        else:  # speaking -- the radius breathes with the REAL volume of the audio
             amp = self._current_amplitude()
             radius = BASE_R + 1.5 + amp * 9.0
             fill_a = 0.82 + amp * 0.15
@@ -335,8 +336,8 @@ class Orb(Gtk.DrawingArea):
             cr.fill()
 
     def _draw_bars(self, cr, cx, cy):
-        # Cada barra lee la envolvente real en un instante ligeramente distinto:
-        # sigue la voz de verdad, no un patrón decorativo desacoplado del audio.
+        # Each bar reads the real envelope at a slightly different instant:
+        # it follows the actual voice, not a decorative pattern detached from the audio.
         bars = 4
         elapsed_ms = (time.time() - self.speak_start) * 1000 if self.speak_start else 0
         offsets = [-2, -1, 0, 1]
@@ -388,7 +389,7 @@ class WalkieButton(Gtk.Window):
         if visual and screen.is_composited():
             self.set_visual(visual)
         else:
-            log("aviso: sin composición, la transparencia no se verá bien")
+            log("warning: no compositing, transparency won't look right")
 
         geo = Gdk.Display.get_default().get_monitor(0).get_geometry()
         self.move(geo.width - SIZE - 46, geo.height - SIZE - 96)
@@ -409,7 +410,7 @@ class WalkieButton(Gtk.Window):
         self.whisper_model = None
         threading.Thread(target=self.load_whisper, daemon=True).start()
 
-        log("=== arrancado (modelo sonnet, flags rápidos) ===")
+        log("=== started (sonnet model, fast flags) ===")
 
     def set_state(self, state):
         self.orb.set_state(state)
@@ -418,10 +419,10 @@ class WalkieButton(Gtk.Window):
         from faster_whisper import WhisperModel
         t0 = time.time()
         self.whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
-        log(f"whisper cargado en {time.time()-t0:.1f}s")
+        log(f"whisper loaded in {time.time()-t0:.1f}s")
         GLib.idle_add(self.set_state, "idle")
 
-    # ---------- interrupciones ----------
+    # ---------- interruptions ----------
     def _stop_tts(self):
         if self.tts_proc and self.tts_proc.poll() is None:
             self.tts_proc.terminate()
@@ -430,7 +431,7 @@ class WalkieButton(Gtk.Window):
         if self.claude_proc and self.claude_proc.poll() is None:
             self.claude_proc.terminate()
 
-    # ---------- grabación ----------
+    # ---------- recording ----------
     def on_press(self, widget, event):
         if self.whisper_model is None or self.orb.state == "recording":
             return True
@@ -447,7 +448,7 @@ class WalkieButton(Gtk.Window):
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         self.set_state("recording")
-        log(f"grabando... (turno {self.current_turn})")
+        log(f"recording... (turn {self.current_turn})")
         return True
 
     def on_release(self, widget, event):
@@ -464,7 +465,7 @@ class WalkieButton(Gtk.Window):
         threading.Thread(target=self.process_turn, args=(self.wav_path, self.current_turn), daemon=True).start()
         return True
 
-    # ---------- turno completo (interrumpible) ----------
+    # ---------- full turn (interruptible) ----------
     def process_turn(self, wav_path, my_turn):
         def superseded():
             return my_turn != self.current_turn
@@ -473,10 +474,10 @@ class WalkieButton(Gtk.Window):
         try:
             size = os.path.getsize(wav_path) if os.path.exists(wav_path) else 0
             if size < 8000:
-                log("clip demasiado corto, se ignora")
+                log("clip too short, ignoring")
                 return
 
-            # captura de pantalla en paralelo con la transcripción, no en serie
+            # screenshot in parallel with transcription, not in series
             screenshot_path = tempfile.mktemp(suffix=".png", dir=ASSISTANT_DIR)
             shot_proc = subprocess.Popen(
                 ["import", "-window", "root", "-silent", "-resize", "1280x", screenshot_path],
@@ -487,17 +488,17 @@ class WalkieButton(Gtk.Window):
             segments, info = self.whisper_model.transcribe(wav_path, language="es")
             text = " ".join(s.text for s in segments).strip()
             shot_proc.wait(timeout=10)
-            log(f"transcrito+captura ({time.time()-t0:.1f}s, turno {my_turn}): {text!r}")
+            log(f"transcribed+captured ({time.time()-t0:.1f}s, turn {my_turn}): {text!r}")
             if not text or superseded():
                 return
 
-            # el marco rojo se dibuja AHORA, después de que la captura ya existe en disco,
-            # así el propio marco nunca aparece dentro de la imagen que Claude va a leer
+            # the red frame is drawn NOW, after the screenshot already exists on disk,
+            # so the frame itself never shows up inside the image Claude is going to read
             GLib.idle_add(flash_capture_indicator)
 
             prompt = (
-                f"El usuario dice por voz: \"{text}\"\n\n"
-                f"Captura de su pantalla en este instante: {screenshot_path}"
+                f"The user says by voice: \"{text}\"\n\n"
+                f"Screenshot of their screen at this instant: {screenshot_path}"
             )
             cmd = ["claude", "-p", prompt, "--permission-mode", "bypassPermissions",
                    "--append-system-prompt", SYSTEM_PROMPT] + FAST_FLAGS
@@ -515,10 +516,10 @@ class WalkieButton(Gtk.Window):
             self.claude_proc = None
 
             if rc is not None and rc < 0:
-                log(f"turno {my_turn} interrumpido a mitad de Claude")
+                log(f"turn {my_turn} interrupted mid-Claude")
                 return
             if superseded():
-                log(f"turno {my_turn} descartado (llegó una respuesta obsoleta)")
+                log(f"turn {my_turn} discarded (got a stale reply)")
                 return
 
             reply = stdout.strip()
@@ -527,7 +528,7 @@ class WalkieButton(Gtk.Window):
                 reply = "Hubo un error al procesar eso."
             else:
                 self.session_started = True
-            log(f"claude respondió ({time.time()-t0:.1f}s, turno {my_turn}): {reply!r}")
+            log(f"claude replied ({time.time()-t0:.1f}s, turn {my_turn}): {reply!r}")
 
             for junk in ("```", "**"):
                 reply = reply.replace(junk, "")
@@ -537,7 +538,7 @@ class WalkieButton(Gtk.Window):
             self._speak(reply, my_turn, superseded)
 
         except Exception as e:
-            log(f"EXCEPCION turno {my_turn}: {e!r}")
+            log(f"EXCEPTION turn {my_turn}: {e!r}")
         finally:
             if screenshot_path:
                 try:
@@ -551,7 +552,7 @@ class WalkieButton(Gtk.Window):
             if not superseded():
                 GLib.idle_add(self.set_state, "idle")
 
-    # ---------- voz de salida, con el orbe sincronizado al audio real ----------
+    # ---------- spoken output, with the orb synced to the real audio ----------
     def _speak(self, text, my_turn, superseded):
         clean_txt = tempfile.mktemp(suffix=".txt", dir=ASSISTANT_DIR)
         mp3_path = tempfile.mktemp(suffix=".mp3", dir=ASSISTANT_DIR)
@@ -566,7 +567,7 @@ class WalkieButton(Gtk.Window):
                 [EDGE_TTS, "--voice", VOICE, f"--rate={RATE}", "--file", clean_txt, "--write-media", mp3_path],
                 check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
             )
-            log(f"tts generado ({time.time()-t0:.1f}s, turno {my_turn})")
+            log(f"tts generated ({time.time()-t0:.1f}s, turn {my_turn})")
             if superseded() or not os.path.exists(mp3_path) or os.path.getsize(mp3_path) == 0:
                 return
 
