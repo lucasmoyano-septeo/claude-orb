@@ -44,10 +44,12 @@ LOG_PATH = os.path.join(ASSISTANT_DIR, "assistant.log")
 
 EDGE_TTS = os.path.join(ASSISTANT_DIR, "venv", "bin", "edge-tts")
 
-# ---- persisted settings (model, voice, rate, window position) --------------
+# ---- persisted settings (backend, model, voice, rate, window position) ----
 CONFIG_PATH = os.path.join(ASSISTANT_DIR, "config.json")
 DEFAULT_CONFIG = {
-    "model": "sonnet",
+    "backend": "claude",
+    "claude_model": "sonnet",
+    "opencode_model": "opencode/big-pickle",
     "voice": "es-ES-ElviraNeural",
     "rate": "+8%",
     "pos_x": None,
@@ -72,13 +74,24 @@ RATE_CHOICES = [
     ("+20%", "Rápida"),
     ("+35%", "Muy rápida"),
 ]
-# Model aliases the claude CLI accepts. Sonnet is the default because it's the
-# fast/clear balance this assistant is tuned for; the others trade that off.
-MODEL_CHOICES = [
+# Model menu, in two sections. Claude models go through the `claude` CLI (paid,
+# your subscription); OpenCode models go through the `opencode` CLI, and the
+# ones listed here are free tiers of opencode's own provider. Every alias in
+# both lists was checked with a real call before being added -- none are
+# guessed. Free models are a different kind of thing: smaller, and in this
+# session's testing, "big-pickle" has no vision at all (it says so itself
+# rather than making something up), so the screenshot step is skipped
+# entirely on the OpenCode backend, for every model in that list.
+CLAUDE_MODEL_CHOICES = [
     ("sonnet", "Sonnet (rápido, recomendado)"),
     ("opus", "Opus (más profundo, más lento)"),
     ("haiku", "Haiku (el más rápido, menos matizado)"),
     ("fable", "Fable (el más nuevo)"),
+]
+OPENCODE_MODEL_CHOICES = [
+    ("opencode/big-pickle", "Big Pickle (gratis)"),
+    ("opencode/nemotron-3.5-lightning-free", "Nemotron 3.5 Lightning (gratis)"),
+    ("opencode/mimo-v2.5-free", "MiMo v2.5 (gratis)"),
 ]
 
 
@@ -101,7 +114,9 @@ def save_config():
 
 
 CONFIG = load_config()
-MODEL = CONFIG["model"]
+BACKEND = CONFIG["backend"]
+CLAUDE_MODEL = CONFIG["claude_model"]
+OPENCODE_MODEL = CONFIG["opencode_model"]
 VOICE = CONFIG["voice"]
 RATE = CONFIG["rate"]
 
@@ -173,20 +188,6 @@ COLORS = {
     "speaking":  (0.14, 0.55, 0.42),
 }
 
-def fast_flags():
-    """Flags that strip everything not needed for a quick voice question
-    (global memory, MCP servers, skill listing, Chrome integration): this is
-    what brings a turn down from ~12-14s (Opus, full context) to ~3-7s.
-    Reads the current MODEL each call, so switching it from the right-click
-    menu takes effect on the very next turn."""
-    return [
-        "--model", MODEL,
-        "--setting-sources", "",
-        "--disable-slash-commands",
-        "--strict-mcp-config",
-        "--no-chrome",
-    ]
-
 SYSTEM_PROMPT = (
     "You are a floating voice assistant on the user's Ubuntu desktop. "
     "On every turn you get what they said by voice. You do NOT get a screenshot automatically -- "
@@ -207,6 +208,41 @@ SYSTEM_PROMPT = (
     "Never use markdown, backticks, asterisks or code blocks: plain speakable text only. "
     "Do not add any summary line or the RESUMEN: label in this tool."
 )
+
+# OpenCode's `run` command has no --append-system-prompt equivalent, so this
+# gets prepended into the message text itself every turn instead. No
+# screenshot instruction here on purpose: tested live, opencode/big-pickle
+# has no vision at all and says so plainly rather than making something up,
+# so offering a capability that doesn't exist would just waste a turn.
+OPENCODE_SYSTEM_PROMPT = (
+    "INSTRUCCIONES FIJAS, válidas para todo lo que sigue: responde SIEMPRE en español, en 1 a 3 "
+    "frases muy breves y clarísimas, como si le explicaras a alguien nuevo en la empresa que no sabe "
+    "nada del proyecto. Nunca uses markdown ni backticks. Tienes bash disponible, con libertad total "
+    "para usarlo sin pedir confirmación cuando ayude a responder o actuar. Termina justo después de "
+    "responder la pregunta -- nunca añadas una línea de RESUMEN, FIRMA, ni nada parecido al final."
+)
+
+
+def build_command(prompt, session):
+    """Builds the CLI invocation for the active backend, and says whether its
+    stdout is Claude's stream-json schema or OpenCode's. `session` is the
+    per-backend dict tracked on WalkieButton: {"id": ..., "started": bool}."""
+    if BACKEND == "opencode":
+        cmd = ["opencode", "run", OPENCODE_SYSTEM_PROMPT + "\n\n" + prompt,
+               "--model", OPENCODE_MODEL, "--format", "json", "--auto"]
+        if session["id"]:
+            cmd += ["--session", session["id"], "--continue"]
+        return cmd, "opencode"
+    cmd = ["claude", "-p", prompt, "--permission-mode", "bypassPermissions",
+           "--append-system-prompt", SYSTEM_PROMPT,
+           "--model", CLAUDE_MODEL, "--setting-sources", "", "--disable-slash-commands",
+           "--strict-mcp-config", "--no-chrome",
+           "--output-format", "stream-json", "--include-partial-messages", "--verbose"]
+    if session["started"]:
+        cmd += ["--resume", session["id"]]
+    else:
+        cmd += ["--session-id", session["id"]]
+    return cmd, "claude"
 
 
 def log(msg):
@@ -814,12 +850,14 @@ class WalkieButton(Gtk.Window):
         self.orb.connect("button-press-event", self.on_press)
         self.orb.connect("button-release-event", self.on_release)
 
-        self.session_id = str(uuid.uuid4())
-        self.session_started = False
+        self.sessions = {
+            "claude": {"id": str(uuid.uuid4()), "started": False},
+            "opencode": {"id": None, "started": False},
+        }
         self.recording_proc = None
         self.wav_path = None
         self.current_turn = 0
-        self.claude_proc = None
+        self.backend_proc = None
         self.pipeline = None
 
         self.gap = GapFiller(self.set_state)
@@ -828,7 +866,8 @@ class WalkieButton(Gtk.Window):
         threading.Thread(target=self.load_whisper, daemon=True).start()
         threading.Thread(target=ensure_fillers, daemon=True).start()
 
-        log(f"=== started (model={MODEL}, voice={VOICE}, rate={RATE}) ===")
+        current = CLAUDE_MODEL if BACKEND == "claude" else OPENCODE_MODEL
+        log(f"=== started (backend={BACKEND}, model={current}, voice={VOICE}, rate={RATE}) ===")
 
     # ---------- position: middle-click drag, persisted ----------
     def _on_configure(self, widget, event):
@@ -861,12 +900,55 @@ class WalkieButton(Gtk.Window):
             item.set_submenu(sub)
             menu.append(item)
 
-        def pick_model(v):
-            global MODEL
-            MODEL = v
-            CONFIG["model"] = v
+        def pick_claude_model(v):
+            global BACKEND, CLAUDE_MODEL
+            BACKEND = "claude"
+            CLAUDE_MODEL = v
+            CONFIG["backend"] = "claude"
+            CONFIG["claude_model"] = v
             save_config()
-            log(f"model switched to {v}")
+            log(f"backend=claude, model switched to {v}")
+
+        def pick_opencode_model(v):
+            global BACKEND, OPENCODE_MODEL
+            BACKEND = "opencode"
+            OPENCODE_MODEL = v
+            CONFIG["backend"] = "opencode"
+            CONFIG["opencode_model"] = v
+            save_config()
+            log(f"backend=opencode, model switched to {v}")
+
+        def build_model_submenu():
+            item = Gtk.MenuItem(label="Modelo")
+            sub = Gtk.Menu()
+            group = None
+
+            def header(text):
+                h = Gtk.MenuItem(label=text)
+                h.set_sensitive(False)
+                sub.append(h)
+
+            header("— Claude —")
+            for value, label in CLAUDE_MODEL_CHOICES:
+                mi = Gtk.RadioMenuItem.new_with_label_from_widget(group, label)
+                group = mi
+                if BACKEND == "claude" and value == CLAUDE_MODEL:
+                    mi.set_active(True)
+                mi.connect("toggled", lambda w, v=value: w.get_active() and pick_claude_model(v))
+                sub.append(mi)
+
+            sub.append(Gtk.SeparatorMenuItem())
+            header("— OpenCode (gratis) —")
+            for value, label in OPENCODE_MODEL_CHOICES:
+                mi = Gtk.RadioMenuItem.new_with_label_from_widget(group, label)
+                group = mi
+                if BACKEND == "opencode" and value == OPENCODE_MODEL:
+                    mi.set_active(True)
+                mi.connect("toggled", lambda w, v=value: w.get_active() and pick_opencode_model(v))
+                sub.append(mi)
+
+            item.set_submenu(sub)
+            menu.append(item)
 
         def pick_voice(v):
             global VOICE
@@ -884,7 +966,7 @@ class WalkieButton(Gtk.Window):
             log(f"rate switched to {v}")
             threading.Thread(target=ensure_fillers, daemon=True).start()
 
-        submenu("Modelo", MODEL_CHOICES, MODEL, pick_model)
+        build_model_submenu()
         submenu("Voz", VOICE_CHOICES, VOICE, pick_voice)
         submenu("Velocidad", RATE_CHOICES, RATE, pick_rate)
 
@@ -933,8 +1015,8 @@ class WalkieButton(Gtk.Window):
         pipeline = self.pipeline
         if pipeline:
             pipeline.cancel()
-        if self.claude_proc and self.claude_proc.poll() is None:
-            self.claude_proc.terminate()
+        if self.backend_proc and self.backend_proc.poll() is None:
+            self.backend_proc.terminate()
 
     # ---------- recording (left button) / drag (middle) / menu (right) ----------
     def on_press(self, widget, event):
@@ -993,33 +1075,35 @@ class WalkieButton(Gtk.Window):
             if not text or superseded():
                 return
 
-            prompt = (
-                f"The user says by voice: \"{text}\"\n\n"
-                f"(Only if you need to see their screen: run `import -window root -resize 1280x "
-                f"{SCREENSHOT_PATH}` via Bash, then read that file. Skip it otherwise.)"
-            )
-            cmd = ["claude", "-p", prompt, "--permission-mode", "bypassPermissions",
-                   "--append-system-prompt", SYSTEM_PROMPT] + fast_flags()
-            if self.session_started:
-                cmd += ["--resume", self.session_id]
+            backend = BACKEND
+            session = self.sessions[backend]
+
+            if backend == "claude":
+                prompt = (
+                    f"The user says by voice: \"{text}\"\n\n"
+                    f"(Only if you need to see their screen: run `import -window root -resize 1280x "
+                    f"{SCREENSHOT_PATH}` via Bash, then read that file. Skip it otherwise.)"
+                )
             else:
-                cmd += ["--session-id", self.session_id]
+                prompt = f'El usuario dice por voz: "{text}"'
+            cmd, kind = build_command(prompt, session)
 
             if superseded():
                 return
-            # Streaming: Claude's text arrives as it is written. Each complete sentence
-            # goes straight to the speech pipeline, which synthesizes and plays it while
-            # the next ones are still being generated. Time-to-first-audio is "first
-            # sentence written + one sentence synthesized", not "whole reply written +
-            # whole reply synthesized".
-            cmd += ["--output-format", "stream-json", "--include-partial-messages", "--verbose"]
+            # Streaming (Claude only): its text arrives as it is written, so each complete
+            # sentence goes straight to the speech pipeline while the next ones are still
+            # being generated. OpenCode's --format json has no incremental deltas -- its
+            # one "text" event carries the whole reply -- so there it's "whole reply
+            # written, then sentence-by-sentence synthesis+playback" instead.
             t0 = time.time()
             stderr_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
-            self.claude_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=stderr_file, text=True)
-            # Claude decides per turn whether it needs to look at the screen. We never take a
-            # screenshot ourselves; we just watch the fixed path it's told to write to, and flash
-            # the red frame the moment (and only the moments) it actually captures something.
-            threading.Thread(target=self._watch_for_capture, args=(self.claude_proc,), daemon=True).start()
+            self.backend_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=stderr_file, text=True)
+            if kind == "claude":
+                # Claude decides per turn whether it needs to look at the screen. We never take
+                # a screenshot ourselves; we just watch the fixed path it's told to write to,
+                # and flash the red frame the moment (and only the moments) it actually
+                # captures something. Not offered at all on OpenCode's free models (no vision).
+                threading.Thread(target=self._watch_for_capture, args=(self.backend_proc,), daemon=True).start()
             # fills the silence until the first real sentence is ready to play
             self.gap.arm()
             pipeline = SpeechPipeline(self.orb, self.gap, self.set_state)
@@ -1028,30 +1112,45 @@ class WalkieButton(Gtk.Window):
 
             buf, full_text, result_text = "", "", None
             first_sentence_at = None
-            for line in self.claude_proc.stdout:
+            for line in self.backend_proc.stdout:
                 if superseded():
                     break
                 try:
                     ev = json.loads(line)
                 except ValueError:
                     continue
-                if ev.get("type") == "stream_event":
-                    e = ev.get("event", {})
-                    if e.get("type") == "content_block_delta" and e.get("delta", {}).get("type") == "text_delta":
-                        piece = e["delta"]["text"]
-                        buf += piece
-                        full_text += piece
-                        ready, buf = split_ready_sentences(buf)
-                        for s in ready:
+                if kind == "claude":
+                    if ev.get("type") == "stream_event":
+                        e = ev.get("event", {})
+                        if e.get("type") == "content_block_delta" and e.get("delta", {}).get("type") == "text_delta":
+                            piece = e["delta"]["text"]
+                            buf += piece
+                            full_text += piece
+                            ready, buf = split_ready_sentences(buf)
+                            for s in ready:
+                                if first_sentence_at is None:
+                                    first_sentence_at = time.time() - t0
+                                pipeline.feed(s)
+                    elif ev.get("type") == "result":
+                        result_text = ev.get("result") or ""
+                else:  # opencode
+                    sid = ev.get("sessionID") or (ev.get("part") or {}).get("sessionID")
+                    if sid and not session["id"]:
+                        session["id"] = sid
+                    if ev.get("type") == "text":
+                        piece = (ev.get("part") or {}).get("text") or ""
+                        if piece:
+                            buf += piece
+                            full_text += piece
                             if first_sentence_at is None:
                                 first_sentence_at = time.time() - t0
-                            pipeline.feed(s)
-                elif ev.get("type") == "result":
-                    result_text = ev.get("result") or ""
+                            ready, buf = split_ready_sentences(buf)
+                            for s in ready:
+                                pipeline.feed(s)
 
-            self.claude_proc.wait(timeout=10)
-            rc = self.claude_proc.returncode
-            self.claude_proc = None
+            self.backend_proc.wait(timeout=15)
+            rc = self.backend_proc.returncode
+            self.backend_proc = None
 
             if (rc is not None and rc < 0) or superseded():
                 log(f"turn {my_turn} interrupted/discarded")
@@ -1060,10 +1159,10 @@ class WalkieButton(Gtk.Window):
 
             if rc != 0:
                 stderr_file.seek(0)
-                log(f"claude ERROR: {stderr_file.read()[:500]}")
+                log(f"{backend} ERROR: {stderr_file.read()[:500]}")
                 pipeline.feed("Hubo un error al procesar eso.")
             else:
-                self.session_started = True
+                session["started"] = True
                 if not full_text and result_text:
                     # no deltas came through (shouldn't happen) -- speak the final result instead
                     full_text = result_text
@@ -1075,7 +1174,7 @@ class WalkieButton(Gtk.Window):
             stderr_file.close()
             pipeline.finish()
 
-            log(f"claude done ({time.time()-t0:.1f}s, first sentence at "
+            log(f"{backend} done ({time.time()-t0:.1f}s, first sentence at "
                 f"{first_sentence_at if first_sentence_at is None else round(first_sentence_at, 1)}s, "
                 f"turn {my_turn}): {full_text[:300]!r}")
 

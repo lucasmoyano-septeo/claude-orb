@@ -15,9 +15,11 @@ a screenshot of your screen taken at that instant, and answers by speaking.
    after the capture, so you know exactly when it "looked". The frame is
    drawn **after** the capture, so it never shows up inside the image
    Claude actually sees.
-4. It sends everything to a Claude Code session (Sonnet model, no extra
-   memory or MCP so it stays fast) with free permission to use `xdotool`
-   (mouse/keyboard) and `import` (screenshots) on its own.
+4. It sends everything to either a Claude Code session (default: Sonnet,
+   no extra memory or MCP so it stays fast) or an OpenCode session running
+   a free model, with free permission to use `xdotool` (mouse/keyboard)
+   and `import` (screenshots) on its own. Pick which one from the
+   right-click menu — see **Two backends** below.
 5. It reads the reply out loud with `edge-tts`, and the orb moves at the
    real rhythm of the audio (it's not a decorative animation: it reads the
    actual volume envelope of the mp3).
@@ -51,6 +53,8 @@ exists exactly so you know when it's looking.
   Python).
 - Python 3.10+.
 - The `claude` CLI (Claude Code) installed and logged in.
+- Optional: the `opencode` CLI installed, if you want the free-model
+  backend. Not required for the Claude side to work.
 
 ```bash
 sudo apt install xdotool imagemagick ffmpeg alsa-utils python3-gi gir1.2-gtk-3.0
@@ -88,14 +92,49 @@ taskbar.
 
 - **Middle-click and drag** the orb to move it anywhere on screen. The
   position is remembered across restarts.
-- **Right-click** for a menu: pick the **model** (Sonnet/Opus/Haiku/Fable),
-  the **voice** (7 Spanish neural voices) and the **speed**. Changes apply
-  from the next turn on and are remembered too. The menu also has "back to
-  the bottom-right corner" if you get it lost.
+- **Right-click** for a menu: pick the **model**, the **voice** (7 Spanish
+  neural voices) and the **speed**. Changes apply from the next turn on and
+  are remembered too. The menu also has "back to the bottom-right corner"
+  if you get it lost.
 - Hovering shows a pointer cursor, like any clickable button.
 
 All of this is saved in `config.json` (gitignored — it's per-machine, not
 part of the project).
+
+### Two backends
+
+The **Modelo** submenu has two sections:
+
+- **Claude** — Sonnet (default), Opus, Haiku, Fable. Goes through the
+  `claude` CLI, uses your subscription, and is the only backend that reads
+  screenshots (Claude decides per turn whether it needs to, as described
+  above).
+- **OpenCode (gratis)** — Big Pickle, Nemotron 3.5 Lightning, MiMo v2.5.
+  Goes through the `opencode` CLI instead, using OpenCode's own free model
+  tier: no subscription, no cost. Picking any of these switches the whole
+  backend, not just the model name — the assistant then talks to `opencode`
+  for every turn until you switch back.
+
+Trade-offs, checked with real calls before writing this, not assumed:
+
+- **No screenshots on OpenCode's free models.** Asked directly, `big-pickle`
+  answered "no puedo ver la captura de pantalla, este modelo no acepta
+  imágenes" instead of guessing — so the screenshot step is skipped
+  entirely on this backend, for every model in that list, rather than
+  wasting a turn on a capability that isn't there.
+- **Free means smaller and rougher.** Without a matching system-prompt flag
+  in the `opencode` CLI, the instructions (Spanish, brief, no stray
+  "RESUMEN:"/"FIRMA:" lines) are prepended into the message itself instead
+  — it follows them, but expect more rough edges than Claude on a
+  demanding question.
+- **No incremental streaming.** OpenCode's `--format json` hands back one
+  event with the whole reply already written, not token-by-token like
+  Claude's `stream-json`. The reply still gets split into sentences and
+  spoken one at a time as each is synthesized, so playback still starts
+  before the last sentence is ready — it's just "whole reply first, then
+  streamed speech" instead of "streamed text and streamed speech".
+- Each backend keeps its own separate conversation; switching mid-chat
+  starts fresh on the other side rather than carrying context over.
 
 ### Swapping the "still thinking" sound
 
