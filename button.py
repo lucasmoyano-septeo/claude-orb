@@ -52,6 +52,7 @@ DEFAULT_CONFIG = {
     "opencode_model": "opencode/big-pickle",
     "voice": "es-ES-ElviraNeural",
     "rate": "+8%",
+    "pitch": "+0Hz",
     "pos_x": None,
     "pos_y": None,
 }
@@ -73,6 +74,15 @@ RATE_CHOICES = [
     ("+8%", "Un poco rápida (por defecto)"),
     ("+20%", "Rápida"),
     ("+35%", "Muy rápida"),
+]
+# Verified with a real measurement (zero-crossing rate goes up with pitch,
+# not just "the flag exists"): -30Hz measured lower, +30Hz measured higher.
+PITCH_CHOICES = [
+    ("-40Hz", "Más grave"),
+    ("-15Hz", "Un poco más grave"),
+    ("+0Hz", "Normal (por defecto)"),
+    ("+15Hz", "Un poco más aguda"),
+    ("+40Hz", "Más aguda"),
 ]
 # Model menu, in two sections. Claude models go through the `claude` CLI (paid,
 # your subscription); OpenCode models go through the `opencode` CLI, and the
@@ -119,6 +129,7 @@ CLAUDE_MODEL = CONFIG["claude_model"]
 OPENCODE_MODEL = CONFIG["opencode_model"]
 VOICE = CONFIG["voice"]
 RATE = CONFIG["rate"]
+PITCH = CONFIG["pitch"]
 
 # Fixed path Claude is told to use when IT decides a turn needs to see the
 # screen. We never take this screenshot ourselves -- we only watch this path
@@ -309,7 +320,7 @@ def ensure_fillers():
     free after the first run."""
     os.makedirs(FILLER_DIR, exist_ok=True)
     manifest_path = os.path.join(FILLER_DIR, "phrases.json")
-    wanted = {"openers": OPENERS, "voice": VOICE, "rate": RATE}
+    wanted = {"openers": OPENERS, "voice": VOICE, "rate": RATE, "pitch": PITCH}
     try:
         with open(manifest_path, encoding="utf-8") as f:
             if json.load(f) == wanted and all(
@@ -328,7 +339,7 @@ def ensure_fillers():
             with open(txt, "w", encoding="utf-8") as f:
                 f.write(phrase)
             subprocess.run(
-                [EDGE_TTS, "--voice", VOICE, f"--rate={RATE}", "--file", txt,
+                [EDGE_TTS, "--voice", VOICE, f"--rate={RATE}", f"--pitch={PITCH}", "--file", txt,
                  "--write-media", _filler_path(kind, i)],
                 check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30,
             )
@@ -443,7 +454,7 @@ def synth_sentence(text, out_path, timeout=8.0):
         try:
             if edge_tts is not None:
                 async def run():
-                    comm = edge_tts.Communicate(text, VOICE, rate=RATE)
+                    comm = edge_tts.Communicate(text, VOICE, rate=RATE, pitch=PITCH)
                     with open(out_path, "wb") as f:
                         async for chunk in comm.stream():
                             if chunk["type"] == "audio":
@@ -453,8 +464,8 @@ def synth_sentence(text, out_path, timeout=8.0):
                 txt = out_path + ".txt"
                 with open(txt, "w", encoding="utf-8") as f:
                     f.write(text)
-                subprocess.run([EDGE_TTS, "--voice", VOICE, f"--rate={RATE}", "--file", txt,
-                                "--write-media", out_path],
+                subprocess.run([EDGE_TTS, "--voice", VOICE, f"--rate={RATE}", f"--pitch={PITCH}",
+                                "--file", txt, "--write-media", out_path],
                                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                timeout=timeout)
                 os.remove(txt)
@@ -867,7 +878,7 @@ class WalkieButton(Gtk.Window):
         threading.Thread(target=ensure_fillers, daemon=True).start()
 
         current = CLAUDE_MODEL if BACKEND == "claude" else OPENCODE_MODEL
-        log(f"=== started (backend={BACKEND}, model={current}, voice={VOICE}, rate={RATE}) ===")
+        log(f"=== started (backend={BACKEND}, model={current}, voice={VOICE}, rate={RATE}, pitch={PITCH}) ===")
 
     # ---------- position: middle-click drag, persisted ----------
     def _on_configure(self, widget, event):
@@ -966,9 +977,18 @@ class WalkieButton(Gtk.Window):
             log(f"rate switched to {v}")
             threading.Thread(target=ensure_fillers, daemon=True).start()
 
+        def pick_pitch(v):
+            global PITCH
+            PITCH = v
+            CONFIG["pitch"] = v
+            save_config()
+            log(f"pitch switched to {v}")
+            threading.Thread(target=ensure_fillers, daemon=True).start()
+
         build_model_submenu()
         submenu("Voz", VOICE_CHOICES, VOICE, pick_voice)
         submenu("Velocidad", RATE_CHOICES, RATE, pick_rate)
+        submenu("Tono", PITCH_CHOICES, PITCH, pick_pitch)
 
         menu.append(Gtk.SeparatorMenuItem())
         reset_item = Gtk.MenuItem(label="Volver a la esquina inferior derecha")

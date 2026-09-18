@@ -93,9 +93,9 @@ taskbar.
 - **Middle-click and drag** the orb to move it anywhere on screen. The
   position is remembered across restarts.
 - **Right-click** for a menu: pick the **model**, the **voice** (7 Spanish
-  neural voices) and the **speed**. Changes apply from the next turn on and
-  are remembered too. The menu also has "back to the bottom-right corner"
-  if you get it lost.
+  neural voices), the **speed** and the **pitch** (higher/lower). Changes
+  apply from the next turn on and are remembered too. The menu also has
+  "back to the bottom-right corner" if you get it lost.
 - Hovering shows a pointer cursor, like any clickable button.
 
 All of this is saved in `config.json` (gitignored — it's per-machine, not
