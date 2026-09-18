@@ -136,13 +136,11 @@ Trade-offs, checked with real calls before writing this, not assumed:
 - Each backend keeps its own separate conversation; switching mid-chat
   starts fresh on the other side rather than carrying context over.
 
-### Swapping the "still thinking" sound
+### The "still thinking" sound
 
-`assets/thinking_loop.mp3` ships with a small synthesized two-tone blip as a
-placeholder. Any short mp3 works — just overwrite that file. If you can grab
-a specific sound from your own browser (myinstants and similar sites block
-direct downloads from servers/scripts with a 403), save it there under that
-exact name.
+`assets/thinking_loop.mp3` ships with the Wii U loading jingle. Any mp3
+works if you'd rather swap it — just overwrite that file under that exact
+name; no restart needed, it's read fresh from disk on every play.
 
 ## Why it's fast (or why it isn't)
 
